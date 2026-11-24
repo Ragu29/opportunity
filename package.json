@@ -1,0 +1,29 @@
+{
+  "name": "onesify-opportunity",
+  "version": "1.0.0",
+  "description": "Shared Oracle Sales Cloud (OSC) opportunity service for all OneSify products (CCD, CrossConnect corp, ...)",
+  "main": "index.js",
+  "private": true,
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js",
+    "test": "node --test \"test/**/*.test.js\"",
+    "migrate:ccd": "node scripts/migrate-ccd.js"
+  },
+  "dependencies": {
+    "app-root-path": "^3.1.0",
+    "axios": "^1.13.2",
+    "dotenv": "^17.2.3",
+    "express": "^5.2.1",
+    "moment": "^2.30.1",
+    "mongodb": "^7.0.0",
+    "nodemailer": "^7.0.12",
+    "winston": "^3.19.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.11"
+  }
+}
