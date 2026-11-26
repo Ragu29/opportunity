@@ -63,7 +63,9 @@ describe("create", () => {
     assert.equal(res.status, 202);
     await flow.settled();
 
-    assert.deepEqual(state.oracleCalls.map((c) => c.name), ["accountTeam", "contact", "opportunity", "salesOrder"]);
+    // Oracle is asked for the opportunity Name before it is created
+    assert.deepEqual(state.oracleCalls.map((c) => c.name), ["findOpportunity", "accountTeam", "contact", "opportunity", "salesOrder"]);
+    assert.equal(calls("findOpportunity")[0].url.includes(encodeURIComponent("Name='OSP_crossconnect_20000'")), true);
     const opportunity = calls("opportunity")[0].data;
     assert.equal(opportunity.Name, "OSP_crossconnect_20000");
     assert.equal(opportunity.OwnerResourcePartyId, "300000625001288");
@@ -117,14 +119,54 @@ describe("create", () => {
   });
 
   test("timeout on the opportunity POST: next attempt finds it in Oracle and saves it, never posts twice", async () => {
-    state.oracle.opportunity = () => timeout();
-    state.oracle.findOpportunity = () => ok({ items: [{ OptyId: 555, OptyNumber: "OPP-555", Name: "OSP_crossconnect_20000" }] });
+    // Oracle created it, but the answer never arrived
+    let createdInOracle = false;
+    state.oracle.opportunity = () => {
+      createdInOracle = true;
+      return timeout();
+    };
+    state.oracle.findOpportunity = () =>
+      ok({ items: createdInOracle ? [{ OptyId: 555, OptyNumber: "OPP-555", Name: "OSP_crossconnect_20000" }] : [] });
     await call("POST", "/create", createBody());
     await flow.settled();
     assert.equal(calls("opportunity").length, 1);
-    assert.equal(calls("findOpportunity").length, 1);
+    assert.equal(calls("findOpportunity").length, 2, "before the first POST, then before the retry");
     assert.equal(record().opportunityNumber, "OPP-555");
     assert.equal(calls("salesOrder").length, 1);
+  });
+
+  test("opportunity already in Oracle before the first create (e.g. made by CCD's in-process flow, not migrated): saved, never posted", async () => {
+    state.oracle.findOpportunity = () => ok({ items: [{ OptyId: 777, OptyNumber: "OPP-777", Name: "OSP_crossconnect_20000" }] });
+    await call("POST", "/create", createBody());
+    await flow.settled();
+    assert.equal(calls("opportunity").length, 0);
+    assert.equal(calls("contact").length, 0);
+    assert.equal(record().opportunityId, "777");
+    assert.equal(record().opportunityNumber, "OPP-777");
+    assert.equal(calls("salesOrder").length, 1, "the flow continues with the found opportunity");
+    assert.equal(record().createPending, undefined, "create run finished");
+  });
+
+  test("lookup before create fails (Oracle down): retried, then created once", async () => {
+    let lookups = 0;
+    state.oracle.findOpportunity = () => (++lookups === 1 ? oracleError(503, "unavailable") : ok({ items: [] }));
+    await call("POST", "/create", createBody());
+    await flow.settled();
+    assert.equal(lookups, 2);
+    assert.equal(calls("opportunity").length, 1);
+    assert.equal(record().opportunityNumber, "OPP-5001");
+  });
+
+  test("two opportunities with the same Name in Oracle: nothing created, failure mail (reconcile by hand)", async () => {
+    const item = (id) => ({ OptyId: id, OptyNumber: `OPP-${id}`, Name: "OSP_crossconnect_20000" });
+    state.oracle.findOpportunity = () => ok({ items: [item(1), item(2)] });
+    await call("POST", "/create", createBody());
+    await flow.settled();
+    assert.equal(calls("opportunity").length, 0);
+    assert.equal(calls("findOpportunity").length, 1, "ambiguous lookup is not retried");
+    assert.match(state.mails[0].subject, /CCD opportunity creation failed/);
+    assert.deepEqual(events(), ["failed"]);
+    assert.equal(record().createPending, undefined, "failed run finished, not resumed on restart");
   });
 
   test("same contact (name, mobile, email) on another request of the account -> reused, not created again", async () => {
@@ -149,7 +191,7 @@ describe("order placed", () => {
     await flow.settled();
 
     assert.deepEqual(
-      state.oracleCalls.map((c) => c.name).slice(4),
+      state.oracleCalls.map((c) => c.name).slice(5),
       ["approval", "submission", "poReceived", "attachment", "orderToErp"]
     );
     const attachment = calls("attachment")[0];

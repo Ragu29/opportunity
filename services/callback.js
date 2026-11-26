@@ -1,13 +1,14 @@
 const axios = require("axios");
-const https = require("https");
 const logger = require("../config/logger");
 const { clean, wait } = require("./util");
 const { retryAttempts, retryDelayMs } = require("./retry");
+const { httpsAgent } = require("./tls");
 
 // events sent to the product (its URL comes from config, never from a request), so it can save the Oracle ids on its
 // own request: opportunity.created, salesOrder.created, flow.completed, failed, dropped.
 // Best effort: retried, then only logged - the product can always read GET /opportunity/:productCode/:reqId.
-const agent = new https.Agent({ rejectUnauthorized: false });
+// The product's certificate is verified (services/tls.js): CALLBACK_TLS_SERVERNAME is the name to check it against
+// when CALLBACK_URL_<CODE> points to localhost.
 
 const callbackUrl = (product) => clean(product.callbackUrlEnv && process.env[product.callbackUrlEnv]);
 
@@ -31,7 +32,7 @@ const sendCallback = async (product, event, doc, extra = {}) => {
     try {
       await axios.post(url, body, {
         headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
-        httpsAgent: agent,
+        httpsAgent: httpsAgent(process.env.CALLBACK_TLS_SERVERNAME),
         timeout: 15000,
       });
       logger.info(`callback -- ${tag} -- ${event} sent to ${url}`);

@@ -106,20 +106,30 @@ npm test                   # in-memory Mongo + stubbed Oracle; nothing external 
 ```
 
 ## Deploy on the OneSify server
-The service runs next to the other product backends, as `/home/sslportal/onesify/opportunity`:
+The service runs next to the other product backends, as `/home/sslportal/onesify/opportunity` (Node 20.19 or newer):
 ```
 cd /home/sslportal/onesify
 git clone https://github.com/Ragu29/opportunity.git opportunity
 cd opportunity && npm ci --omit=dev
-cp .env.example .env       # prod values; SSL_KEY_PATH / SSL_CERT_PATH -> the shared /home/sslportal/onesify/cert files
-NODE_ENV=prod pm2 start index.js --name onesify-opportunity && pm2 save
+# env file: .env.dev on demo, .env on prod (never both on prod)
+pm2 start ecosystem.config.js              # demo (NODE_ENV dev)
+pm2 start ecosystem.config.js --env prod   # prod
+pm2 save
 ```
-After that:
-- Pick a free `PORT` (check `pm2 ls` and the gateway config).
-- Add a gateway rule `/onesify/opportunity/` → `localhost:<PORT>`, the same form as the other products.
-- Add `opportunity/` to the root `/home/sslportal/onesify/.gitignore`.
+- **One instance.** `ecosystem.config.js` runs one process and gives a restart 70 s to finish running Oracle calls. At startup, work a stopped process left unfinished is resumed (`services/recovery.js`).
+- **Certificates are always verified.** `cert/server.crt` holds only the `*.sifytechnologies.com` certificate, so:
+  - `SSL_CHAIN_PATH`: the Sectigo intermediate, sent with this service's certificate.
+  - `TLS_CA_FILE`: the same intermediate, used to verify the product's callback endpoint, which sends no chain.
+  - `CALLBACK_TLS_SERVERNAME`: a `*.sifytechnologies.com` name, because callbacks go to `https://localhost:<port>`.
+- Pick a free `PORT` (`ss -ltnp`). Products on the same server call `https://localhost:<PORT>`, so a gateway rule is only needed for outside access.
 
-### Moving CCD over
-1. Deploy this service and test it against OSC test with the CCD config.
-2. Copy existing CCD records: `SOURCE_MONGODB_DBNAME=<ccd db> node scripts/migrate-ccd.js` (dry run), then add `--apply`.
-3. Switch crossconnect-domestic to the client behind a flag. Keep its old in-process code for one release as a fallback.
+### Moving CCD over (crossconnect-domestic `USE_OPPORTUNITY_SERVICE`)
+1. Start this service and check `/health` and `/products`.
+2. Set CCD's `OPPORTUNITY_*` values and `USE_OPPORTUNITY_SERVICE=true`, then restart CCD. Its in-process flow stops with the restart.
+3. Right after: `node scripts/migrate-ccd.js` (dry run), then `--apply`. It inserts records or fills in missing fields, never overwrites, and is safe to run again. It also lists requests nothing will start by itself; send those to `POST /retry`.
+4. Until the migration ran, a create for an in-flight request is still safe: Oracle is asked for the opportunity Name before every create.
+
+### Rollback to CCD's in-process flow
+1. `pm2 stop onesify-opportunity`.
+2. `node scripts/export-ccd.js` (dry run), then `--apply`. This copies the service's CCD records back into `ccd_opportunity` with the same rules, so the in-process flow can finish what the service started.
+3. Set CCD's `USE_OPPORTUNITY_SERVICE=false` and restart CCD.

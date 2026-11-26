@@ -69,7 +69,8 @@ const normalizeRequest = (product, body) => {
   return request;
 };
 
-// stores the request data on the record (only while no opportunity exists yet; afterwards the saved data is kept)
+// stores the request data on the record (only while no opportunity exists yet; afterwards the saved data is kept).
+// createPending marks an accepted create until its run finishes, so a restart resumes it (services/recovery.js).
 const acceptCreate = async (product, reqId, request) => {
   const collection = await store.getCollection();
   const key = store.keyOf(product, reqId);
@@ -77,7 +78,7 @@ const acceptCreate = async (product, reqId, request) => {
   try {
     await collection.updateOne(
       { ...key, opportunityId: { $exists: false } },
-      { $set: { ...key, request, ebsAccountNo: request.customer.ebsAccountNo, companyName: request.customer.companyName, updatedDate: time }, $setOnInsert: { createdDate: time } },
+      { $set: { ...key, request, createPending: true, ebsAccountNo: request.customer.ebsAccountNo, companyName: request.customer.companyName, updatedDate: time }, $setOnInsert: { createdDate: time } },
       { upsert: true }
     );
   } catch (e) {
@@ -187,25 +188,28 @@ const createOpportunityOnce = async (product, reqId) => {
     logger.info(`${log} -- attempt started -- company: ${company.companyName || "-"}, ebsAccountNo ${company.ebsAccountNo}, oscPartyNo ${company.oscPartyNo}, oscPartyId ${company.oscPartyId} -- EffectiveDate: ${date} -- ChildRevenue: ${logBody(childRevenue)}`);
     const savedFields = { EffectiveDate: date, ebsAccountNo: company.ebsAccountNo, companyName: company.companyName, oscpartyId: company.oscPartyId };
 
-    // an earlier POST timed out / failed (5xx): ask Oracle before posting again
-    if (existing.opportunityStatus === S.UNKNOWN) {
-      logger.info(`${log} -- opportunityStatus ${S.UNKNOWN}: looking for ${P.opportunityName(product, reqId)} in Oracle before creating again`);
-      let found;
-      try {
-        found = await osc.findOpportunityInOracle(product, reqId, tag);
-      } catch (e) {
-        throw httpError(502, `Opportunity outcome still unknown, Oracle lookup failed: ${e.message}`, {
-          code: e.code === "LOOKUP_AMBIGUOUS" ? e.code : "OPPORTUNITY_OUTCOME_UNKNOWN",
-        });
-      }
-      if (found) {
-        await retryDb("create_opportunity", tag, async () => {
-          const saved = await store.saveOpportunity(collection, key, { ...found, ...savedFields });
-          if (!saved.matched) throw new Error("no opportunity record matched");
-        });
-        logger.info(`${log} -- found in Oracle (opportunityId ${found.opportunityId}), saved without creating a second one`);
-        return { statusCode: 200, body: success("Opportunity found in Oracle and saved", { ...key, ...found, KeyContactId: existing.KeyContactId }) };
-      }
+    // ask Oracle before every create: an earlier POST may have timed out / failed (UNKNOWN), and an opportunity with
+    // this Name may already exist from before the record was here (e.g. created by the product's own in-process flow
+    // and not migrated). Found -> saved, never created a second time.
+    const unknown = existing.opportunityStatus === S.UNKNOWN;
+    logger.info(`${log} -- ${unknown ? `opportunityStatus ${S.UNKNOWN}: ` : ""}looking for ${P.opportunityName(product, reqId)} in Oracle before creating`);
+    let found;
+    try {
+      found = await osc.findOpportunityInOracle(product, reqId, tag);
+    } catch (e) {
+      throw httpError(502, `${unknown ? "Opportunity outcome still unknown, " : ""}Oracle lookup before create failed: ${e.message}`, {
+        code: e.code === "LOOKUP_AMBIGUOUS" ? e.code : unknown ? "OPPORTUNITY_OUTCOME_UNKNOWN" : undefined,
+      });
+    }
+    if (found) {
+      await retryDb("create_opportunity", tag, async () => {
+        const saved = await store.saveOpportunity(collection, key, { ...found, ...savedFields });
+        if (!saved.matched) throw new Error("no opportunity record matched");
+      });
+      logger.info(`${log} -- found in Oracle (opportunityId ${found.opportunityId}), saved without creating a second one`);
+      return { statusCode: 200, body: success("Opportunity found in Oracle and saved", { ...key, ...found, KeyContactId: existing.KeyContactId }) };
+    }
+    if (unknown) {
       logger.info(`${log} -- not found in Oracle, creating it again`);
       await collection.updateOne(
         { ...key, opportunityId: { $exists: false }, opportunityStatus: S.UNKNOWN },
@@ -310,6 +314,13 @@ const attemptError = (result) =>
 
 const loadDoc = async (product, reqId) => (await store.getCollection()).findOne(store.keyOf(product, reqId));
 
+// the create run finished (created, or failed after the last attempt): nothing left for a restart to resume
+const finishCreate = (product, reqId) =>
+  store
+    .getCollection()
+    .then((collection) => collection.updateOne(store.keyOf(product, reqId), { $unset: { createPending: "" } }))
+    .catch((err) => logger.error(`create_opportunity -- ${tagOf(product.productCode, reqId)} -- clearing createPending failed: ${err.message}`));
+
 // stage 1 with retries, then stages 2-7; one failure mail after the last attempt
 const processOpportunity = async (product, reqId) => {
   const tag = tagOf(product.productCode, reqId);
@@ -321,6 +332,7 @@ const processOpportunity = async (product, reqId) => {
     result = await createOpportunityOnce(product, reqId);
     if (!result.error && result.statusCode < 400) {
       if (attempt > 1) logger.info(`create_opportunity -- ${tag} -- succeeded on attempt ${attempt}/${attempts}`);
+      await finishCreate(product, reqId);
       const doc = await loadDoc(product, reqId);
       await sendCallback(product, "opportunity.created", doc || result.body.data || { reqId });
       startFlow(product, reqId);
@@ -336,6 +348,7 @@ const processOpportunity = async (product, reqId) => {
   }
   const errorMessage = attemptError(result);
   logger.error(`create_opportunity -- ${tag} -- FAILED after ${attempt} attempt(s), sending error mail: ${errorMessage}`);
+  await finishCreate(product, reqId);
   if (result.failedRequest) {
     const opportunityError = { ...result.failedRequest, message: errorMessage, attempts: attempt, date: now() };
     await store

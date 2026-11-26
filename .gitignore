@@ -9,6 +9,9 @@ node_modules/
 *.pem
 *.crt
 cert/
+# test-only certificates (a throwaway CA made for test/tls.test.js, trusted nowhere else)
+!test/fixtures/tls/
+!test/fixtures/tls/*
 
 # logs
 logs/

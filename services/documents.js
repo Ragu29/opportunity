@@ -1,6 +1,6 @@
 const axios = require("axios");
-const https = require("https");
 const logger = require("../config/logger");
+const { httpsAgent } = require("./tls");
 const P = require("./payloadBuilder");
 const store = require("./store");
 const { httpError, clean, now } = require("./util");
@@ -85,8 +85,8 @@ const getSignedDocument = async (doc, tag) => {
       url,
       responseType: "arraybuffer",
       maxContentLength: MAX_DOCUMENT_BYTES,
-      // internal OneSify hosts use the shared self-signed certificate (same as the product services)
-      httpsAgent: new https.Agent({ rejectUnauthorized: false }),
+      // certificate verified; TLS_CA_FILE supplies the intermediate when the host does not send it (services/tls.js)
+      httpsAgent: httpsAgent(),
       timeout: 30000,
     });
   } catch (e) {
